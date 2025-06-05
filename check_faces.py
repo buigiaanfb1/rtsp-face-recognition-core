@@ -1,3 +1,5 @@
+import os
+from dotenv import load_dotenv
 import cv2
 import face_recognition
 import requests
@@ -5,12 +7,16 @@ import numpy as np
 from PIL import ImageFont, ImageDraw, Image
 from datetime import datetime
 
+# Load environment variables
+load_dotenv()
+MEMBERS_URL = os.getenv("MEMBERS_URL")
+RTSP_URL = os.getenv("RTSP_URL")
+
 # === RTSP stream ===
-rtsp_url = "rtsp://admin:An29122001@192.168.1.30:554/cam/realmonitor?channel=1&subtype=1"
-video_capture = cv2.VideoCapture(rtsp_url)
+video_capture = cv2.VideoCapture(RTSP_URL)
 
 # === Load member data ===
-response = requests.get("https://google-sheets-listener.vercel.app/members/subscriptions")
+response = requests.get(MEMBERS_URL)
 members = response.json()
 
 known_encodings = []

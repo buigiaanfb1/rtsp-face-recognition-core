@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 .env
+face_cache/
+face_cache.pkl

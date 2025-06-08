@@ -3,8 +3,10 @@ import cv2
 import time
 import requests
 import numpy as np
+import threading
+import pickle
+from datetime import datetime, date
 from dotenv import load_dotenv
-from datetime import datetime
 from PIL import ImageFont, ImageDraw, Image
 from imutils.video import VideoStream
 import face_recognition
@@ -13,178 +15,182 @@ import face_recognition
 load_dotenv()
 MEMBERS_URL = os.getenv("MEMBERS_URL")
 RTSP_URL = os.getenv("RTSP_URL")
+CACHE_FILE = "face_cache.pkl"
 
-# === Load known encodings ===
+# === Global variables ===
 known_encodings = []
 known_names = []
 valid_to_dates = []
+last_loaded_date = None
+cache_lock = threading.Lock()
 
+# === Load face encodings from cache or API ===
 def load_members():
-    print("🔄 Đang lấy thông tin thành viên...")
+    global known_encodings, known_names, valid_to_dates, last_loaded_date
 
-    try:
-        response = requests.get(MEMBERS_URL)
-        response.raise_for_status()
-        members = response.json()
-        print(f"✅ Đã lấy được thông tin của {len(members)} thành viên từ API.")
-    except Exception as e:
-        print(f"❌ Lấy thông tin thành viên thất bại: {e}")
+    today = date.today()
+    if last_loaded_date == today:
         return
 
-    total_images = 0
-    encoded_count = 0
+    with cache_lock:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "rb") as f:
+                cache = pickle.load(f)
+                if cache.get("date") == str(today):
+                    print("✅ Dùng cache hôm nay.")
+                    known_encodings = cache["encodings"]
+                    known_names = cache["names"]
+                    valid_to_dates = cache["dates"]
+                    last_loaded_date = today
+                    return
 
-    for idx, member in enumerate(members):
-        name = member.get("name", "Unknown")
-        subscription_end = member.get("endSubscriptionDate")
-        images = member.get("images", [])
+        print("🔄 Tải dữ liệu thành viên từ API...")
+        try:
+            response = requests.get(MEMBERS_URL)
+            response.raise_for_status()
+            members = response.json()
+        except Exception as e:
+            print(f"❌ Lỗi tải dữ liệu: {e}")
+            return
 
-        print(f"📦 [{idx+1}/{len(members)}] Đang xử lí thành viên: {name} ({len(images)} ảnh)")
+        encodings, names, dates = [], [], []
 
-        for img_idx, img_url in enumerate(images):
-            total_images += 1
-            try:
-                img_data = requests.get(img_url).content
-                np_img = np.frombuffer(img_data, np.uint8)
-                img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+        for idx, member in enumerate(members):
+            name = member.get("name", "Unknown")
+            subscription_end = member.get("endSubscriptionDate")
+            images = member.get("images", [])
 
-                if img is None:
-                    print(f"  ⚠️ Decode ảnh thất bại: {img_url}")
-                    continue
+            for img_url in images:
+                try:
+                    img_data = requests.get(img_url).content
+                    np_img = np.frombuffer(img_data, np.uint8)
+                    img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+                    if img is None:
+                        continue
 
-                rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                encodings = face_recognition.face_encodings(rgb_img)
+                    rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    enc = face_recognition.face_encodings(rgb_img)
+                    if enc:
+                        encodings.append(enc[0])
+                        names.append(name)
+                        dates.append(subscription_end)
+                except Exception as e:
+                    print(f"⚠️ Lỗi khi xử lý ảnh: {e}")
 
-                if encodings:
-                    known_encodings.append(encodings[0])
-                    known_names.append(name)
-                    valid_to_dates.append(subscription_end)
-                    encoded_count += 1
-                    print(f"  ✅ Ảnh {img_idx+1} encoding thành công.")
-                else:
-                    print(f"  ⚠️  Ảnh {img_idx+1} không tìm thấy mặt.")
+        known_encodings = encodings
+        known_names = names
+        valid_to_dates = dates
+        last_loaded_date = today
 
-            except Exception as e:
-                print(f"  ❌ Có lỗi trong quá trình xử lí ảnh {img_url}: {e}")
+        with open(CACHE_FILE, "wb") as f:
+            pickle.dump({
+                "date": str(today),
+                "encodings": known_encodings,
+                "names": known_names,
+                "dates": valid_to_dates
+            }, f)
 
-
-load_members()
+        print(f"✅ Đã encode {len(known_encodings)} khuôn mặt.")
 
 # === Drawing helper ===
-def draw_text_with_pil(frame, text, position, color=(0, 255, 0)):
+def draw_text(frame, text, pos, color=(0, 255, 0)):
     pil_img = Image.fromarray(frame)
     draw = ImageDraw.Draw(pil_img)
     try:
         font = ImageFont.truetype("Roboto-Regular.ttf", 24)
-    except IOError:
+    except:
         font = ImageFont.load_default()
-    draw.text(position, text, font=font, fill=color)
+    draw.text(pos, text, font=font, fill=color)
     return np.array(pil_img)
 
-# === Constants ===
-THRESHOLD = 0.5
-FRAME_SKIP = 10
-frame_count = 0
-cached_results = []
-
-# === Face recognition logic ===
+# === Face Recognition ===
 def recognize_faces(frame):
     small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-    rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-    face_locations = face_recognition.face_locations(rgb_small_frame)
-    face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+    rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+
+    face_locations = face_recognition.face_locations(rgb_small)
+    face_encodings = face_recognition.face_encodings(rgb_small, face_locations)
 
     results = []
-    for (top, right, bottom, left), encoding in zip(face_locations, face_encodings):
-        distances = face_recognition.face_distance(known_encodings, encoding)
-        if len(distances) == 0:
-            name = "Người lạ"
-            color = (0, 0, 255)
-            end_date_str = ""
-            days_left_text = ""
-        else:
-            best_index = np.argmin(distances)
-            best_distance = distances[best_index]
-            if best_distance < THRESHOLD:
-                name = known_names[best_index]
-                end_date_str = valid_to_dates[best_index]
-                color = (0, 255, 0)
-                days_left_text = ""
-                if end_date_str:
-                    try:
-                        end_date = datetime.strptime(end_date_str, "%m/%d/%Y")
-                        now = datetime.now()
-                        days_left = (end_date - now).days
-                        days_left_text = f"Còn {days_left} ngày" if days_left >= 0 else "Hết hạn"
-                        if days_left < 0:
-                            color = (0, 0, 255)
-                    except Exception as e:
-                        print("Date parse error:", e)
-            else:
-                name = "Người lạ"
-                color = (0, 0, 255)
-                end_date_str = ""
-                days_left_text = ""
+    for (top, right, bottom, left), enc in zip(face_locations, face_encodings):
+        if not known_encodings:
+            continue
+
+        distances = face_recognition.face_distance(known_encodings, enc)
+        idx = np.argmin(distances)
+        name = "Người lạ"
+        color = (0, 0, 255)
+        date_text = ""
+        days_text = ""
+
+        if distances[idx] < 0.5:
+            name = known_names[idx]
+            end_date_str = valid_to_dates[idx]
+            try:
+                end_date = datetime.strptime(end_date_str, "%m/%d/%Y")
+                days_left = (end_date - datetime.now()).days
+                date_text = end_date.strftime("%d/%m/%Y")
+                if days_left >= 0:
+                    days_text = f"Còn {days_left} ngày"
+                    color = (0, 255, 0)
+                else:
+                    days_text = "Hết hạn"
+            except:
+                days_text = "Lỗi ngày"
 
         results.append({
-            "top": top * 2,
-            "right": right * 2,
-            "bottom": bottom * 2,
-            "left": left * 2,
-            "name": name,
-            "end_date": end_date_str,
-            "days_left_text": days_left_text,
-            "color": color
+            "top": top * 2, "right": right * 2,
+            "bottom": bottom * 2, "left": left * 2,
+            "name": name, "date": date_text,
+            "days_text": days_text, "color": color
         })
     return results
 
-# === Drawing results ===
+# === Draw Boxes ===
 def draw_faces(frame, faces):
-    for face in faces:
-        top, right, bottom, left = face["top"], face["right"], face["bottom"], face["left"]
-        name, end_date, days_left_text = face["name"], face["end_date"], face["days_left_text"]
-        color = face["color"]
-
-        cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-        frame = draw_text_with_pil(frame, name, (left, top - 40), color)
-        if end_date:
-            frame = draw_text_with_pil(frame, end_date, (left, top - 20), color)
-        if days_left_text:
-            frame = draw_text_with_pil(frame, days_left_text, (left, top), color)
+    for f in faces:
+        cv2.rectangle(frame, (f["left"], f["top"]), (f["right"], f["bottom"]), f["color"], 2)
+        frame = draw_text(frame, f["name"], (f["left"], f["top"] - 45), f["color"])
+        if f["date"]:
+            frame = draw_text(frame, f["date"], (f["left"], f["top"] - 25), f["color"])
+        if f["days_text"]:
+            frame = draw_text(frame, f["days_text"], (f["left"], f["top"] - 5), f["color"])
     return frame
 
-# === Main loop ===
+# === Main App ===
 def main():
-    global frame_count, cached_results
-
-    video_capture = VideoStream(src=RTSP_URL).start()
-    time.sleep(2.0)  # Warm-up stream
-    prev_time = time.time()
+    print("📹 Đang kết nối camera...")
+    load_members()
+    stream = VideoStream(src=RTSP_URL).start()
+    time.sleep(2)
+    fps_time = time.time()
+    frame_count = 0
+    cached_faces = []
 
     while True:
-        frame = video_capture.read()
+        load_members()  # reload if day changed
+
+        frame = stream.read()
         if frame is None:
-            print("Can't read frame from camera")
+            print("❌ Không đọc được khung hình.")
             break
 
         frame_count += 1
-        if frame_count % FRAME_SKIP == 0:
-            cached_results = recognize_faces(frame)
+        if frame_count % 10 == 0:
+            cached_faces = recognize_faces(frame)
 
-        frame = draw_faces(frame, cached_results)
+        frame = draw_faces(frame, cached_faces)
 
-        # === Optional: Show FPS ===
-        curr_time = time.time()
-        fps = 1 / (curr_time - prev_time)
-        prev_time = curr_time
-        frame = draw_text_with_pil(frame, f"FPS: {int(fps)}", (10, 30), (255, 255, 0))
+        fps = 1 / (time.time() - fps_time)
+        fps_time = time.time()
+        frame = draw_text(frame, f"FPS: {int(fps)}", (10, 30), (255, 255, 0))
 
-        cv2.imshow("Gym Face Recognition", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        cv2.imshow("🧠 Face Recognition", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
+    stream.stop()
     cv2.destroyAllWindows()
-    video_capture.stop()
 
 if __name__ == "__main__":
     main()
